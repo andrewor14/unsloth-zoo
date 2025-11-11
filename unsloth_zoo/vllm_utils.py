@@ -818,9 +818,10 @@ def vllm_dynamic_quant_supported(
 pass
 
 
-@torch.inference_mode
-def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
-    # All Unsloth Zoo code licensed under LGPLv3
+def _get_vllm_model(llm):
+    """
+    Helper function to get the vLLM model directly, collective_rpc not supported yet.
+    """
     # Unmerges vLLM modules and returns HF equivalent state_dict
     # vllm_state_dict = {}
     try:
@@ -832,6 +833,7 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         else:
             # V0 engine - direct access
             vllm_internals = llm_engine.model_executor.driver_worker.model_runner.model
+        return vllm_internals
     except:
         # Using a new VLLM version must use collective_rpc
         try:
@@ -846,6 +848,12 @@ def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision
         except Exception as e:
             raise RuntimeError(f"Unsloth: Cannot get internal vLLM states with error = {str(e)}")
     pass
+
+
+@torch.inference_mode
+def get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
+    # All Unsloth Zoo code licensed under LGPLv3
+    vllm_internals = _get_vllm_model(llm)
 
     assert(config is not None)
 
@@ -1524,6 +1532,7 @@ def load_vllm(
     unsloth_vllm_standby   : bool = False,
     is_vision_model        : bool = False,
     return_args            : bool = False, # Just return args
+    use_torchao_float8     : bool = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -1918,6 +1927,59 @@ def load_vllm(
                 raise RuntimeError(error)
         pass
     pass
+
+    # Dynamically quantize the vllm model using torchao
+    # After this is done, all linear weights should be Float8Tensors
+    #
+    # TODO: a better way to do this is to pass some configs to vLLM
+    # and dynamically quantize there instead, but this will need
+    # on-the-fly support added in: https://github.com/vllm-project/vllm/pull/26327.
+    # After that PR is landed, we should do the following instead:
+    #
+    #   llm = LLM(
+    #     ...
+    #     hf_overrides={"quantization_config_file": "torchao_config.json"},
+    #   )
+    #
+    #if use_torchao_float8:
+    if True:
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            Float8MMConfig,
+            Float8Tensor,
+        )
+        from torchao.quantization.quantize_.workflows import QuantizeTensorToFloat8Kwargs
+        from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
+        from vllm.model_executor.parameter import ModelWeightParameter
+        model = _get_vllm_model(llm)
+        # Llama3.2, Gemma3, and Qwen2.5 VL has text model under `model.language_model.model`
+        model = getattr(model, "language_model", model)
+        model = getattr(model, "model", model)
+        def _quantize_to_torchao_float8(mod):
+            if not isinstance(mod, BaseLinearLayerWithLoRA):
+                return
+            param = mod.base_layer.weight
+            assert isinstance(param, ModelWeightParameter)
+            new_param_data = 
+Float8Tensor.from_hp(
+    param.data,
+    mm_config=Float8MMConfig(),
+    act_quant_kwargs=QuantizeTensorToFloat8Kwargs(),
+)
+            new_param = ModelWeightParameter(
+            )
+
+            param.tempy = Float8Tensor.from_hp(
+                param.data,
+                mm_config=Float8MMConfig(),
+                act_quant_kwargs=QuantizeTensorToFloat8Kwargs(),
+            )
+        for i in range(len(model.layers)):
+           _quantize_to_torchao_float8(model.layers[i].self_attn.qkv_proj.weight)
+           _quantize_to_torchao_float8(model.layers[i].self_attn.o_proj.weight)
+           _quantize_to_torchao_float8(model.layers[i].mlp.gate_up_proj.weight)
+           _quantize_to_torchao_float8(model.layers[i].mlp.down_proj.weight)
+
     # Save maximum requests length since llm.generate fails to partition inputs sometimes
     llm.approx_max_num_seqs = approx_max_num_seqs
 
@@ -1928,6 +1990,12 @@ def load_vllm(
     for _ in range(3):
         gc.collect()
         torch.cuda.empty_cache()
+
+    print("Hey I just made a vllm, what is my model name?", model_name)
+    print("Hey I just made a vllm, what is my layers[0].self_attn.qkv_proj.weight?", llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.model.model.layers[0].self_attn.qkv_proj.weight)
+    model = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.model.model
+    breakpoint()
+
     return llm
 pass
 
